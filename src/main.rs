@@ -16,9 +16,11 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::Write;
-use std::path::Path;
+use std::path::PathBuf;
 
+use clap::Parser;
 use lazy_static::lazy_static;
+use log::{error, info, warn};
 use symphonia::core::codecs::{DecoderOptions, FinalizeResult, CODEC_TYPE_NULL};
 use symphonia::core::errors::{Error, Result};
 use symphonia::core::formats::{Cue, FormatOptions, FormatReader, SeekMode, SeekTo, Track};
@@ -26,9 +28,6 @@ use symphonia::core::io::{MediaSource, MediaSourceStream, ReadOnlySource};
 use symphonia::core::meta::{ColorMode, MetadataOptions, MetadataRevision, Tag, Value, Visual};
 use symphonia::core::probe::{Hint, ProbeResult};
 use symphonia::core::units::{Time, TimeBase};
-
-use clap::{Arg, ArgMatches};
-use log::{error, info, warn};
 
 mod output;
 
@@ -40,84 +39,67 @@ enum SeekPosition {
     Timestamp(u64),
 }
 
+/// Refined Advanced Music Player
+#[derive(Parser)]
+#[command(name = "RAMP")]
+#[command(version = "1.0")]
+#[command(author = "Marcin Kopa <marcin@marcin.info>")]
+#[command(about = "Refined Advanced Music Player", long_about = None)]
+struct Args {
+    /// The input file path, or - to use standard input
+    #[arg(value_name = "INPUT")]
+    input: PathBuf,
+
+    /// Seek to the time in seconds
+    #[arg(long, short = 's', value_name = "TIME")]
+    #[arg(conflicts_with_all = ["seek_ts", "decode_only", "probe_only", "verify", "verify_only"])]
+    seek: Option<f64>,
+
+    /// Seek to the timestamp in timebase units
+    #[arg(long, short = 'S', value_name = "TIMESTAMP")]
+    #[arg(conflicts_with_all = ["seek", "decode_only", "probe_only", "verify", "verify_only"])]
+    seek_ts: Option<u64>,
+
+    /// The track to use
+    #[arg(long, short = 't', value_name = "TRACK")]
+    track: Option<usize>,
+
+    /// Decode, but do not play the audio
+    #[arg(long)]
+    #[arg(conflicts_with_all = ["probe_only", "verify_only", "verify"])]
+    decode_only: bool,
+
+    /// Only probe the input for metadata
+    #[arg(long)]
+    #[arg(conflicts_with_all = ["decode_only", "verify_only"])]
+    probe_only: bool,
+
+    /// Verify the decoded audio is valid, but do not play the audio
+    #[arg(long)]
+    #[arg(conflicts_with = "verify")]
+    verify_only: bool,
+
+    /// Verify the decoded audio is valid during playback
+    #[arg(long, short = 'v')]
+    verify: bool,
+
+    /// Do not display playback progress
+    #[arg(long)]
+    no_progress: bool,
+
+    /// Disable gapless decoding and playback
+    #[arg(long)]
+    no_gapless: bool,
+
+    /// Dump all visuals to the current working directory
+    #[arg(long)]
+    dump_visuals: bool,
+}
+
 fn main() {
     pretty_env_logger::init();
 
-    let args = clap::Command::new("RAMP")
-        .version("1.0")
-        .author("Marcin Kopa <marcin@marcin.info>")
-        .about("Refined Advanced Music Player")
-        .arg(
-            Arg::new("seek")
-                .long("seek")
-                .short('s')
-                .value_name("TIME")
-                .help("Seek to the time in seconds")
-                .conflicts_with_all(&[
-                    "seek-ts",
-                    "decode-only",
-                    "probe-only",
-                    "verify",
-                    "verify-only",
-                ]),
-        )
-        .arg(
-            Arg::new("seek-ts")
-                .long("seek-ts")
-                .short('S')
-                .value_name("TIMESTAMP")
-                .help("Seek to the timestamp in timebase units")
-                .conflicts_with_all(&[
-                    "seek",
-                    "decode-only",
-                    "probe-only",
-                    "verify",
-                    "verify-only",
-                ]),
-        )
-        .arg(
-            Arg::new("track").long("track").short('t').value_name("TRACK").help("The track to use"),
-        )
-        .arg(
-            Arg::new("decode-only")
-                .long("decode-only")
-                .help("Decode, but do not play the audio")
-                .conflicts_with_all(&["probe-only", "verify-only", "verify"]),
-        )
-        .arg(
-            Arg::new("probe-only")
-                .long("probe-only")
-                .help("Only probe the input for metadata")
-                .conflicts_with_all(&["decode-only", "verify-only"]),
-        )
-        .arg(
-            Arg::new("verify-only")
-                .long("verify-only")
-                .help("Verify the decoded audio is valid, but do not play the audio")
-                .conflicts_with_all(&["verify"]),
-        )
-        .arg(
-            Arg::new("verify")
-                .long("verify")
-                .short('v')
-                .help("Verify the decoded audio is valid during playback"),
-        )
-        .arg(Arg::new("no-progress").long("no-progress").help("Do not display playback progress"))
-        .arg(
-            Arg::new("no-gapless").long("no-gapless").help("Disable gapless decoding and playback"),
-        )
-        .arg(
-            Arg::new("dump-visuals")
-                .long("dump-visuals")
-                .help("Dump all visuals to the current working directory"),
-        )
-        .arg(
-            Arg::new("INPUT")
-                .help("The input file path, or - to use standard input")
-                .required(true)
-                .index(1),
-        )
-        .get_matches();
+    let args = Args::parse();
 
     // For any error, return an exit code -1. Otherwise, return the exit code provided.
     let code = run(&args).unwrap_or_else(|err| {
@@ -128,8 +110,8 @@ fn main() {
     std::process::exit(code)
 }
 
-fn run(args: &ArgMatches) -> Result<i32> {
-    let path = Path::new(args.value_of("INPUT").unwrap());
+fn run(args: &Args) -> Result<i32> {
+    let path = &args.input;
 
     // Create a hint to help the format registry guess what format reader is appropriate.
     let mut hint = Hint::new();
@@ -137,8 +119,7 @@ fn run(args: &ArgMatches) -> Result<i32> {
     // If the path string is '-' then read from standard input.
     let source = if path.as_os_str() == "-" {
         Box::new(ReadOnlySource::new(std::io::stdin())) as Box<dyn MediaSource>
-    }
-    else {
+    } else {
         // Otherwise, get a Path from the path string.
 
         // Provide the file extension as a hint.
@@ -156,24 +137,18 @@ fn run(args: &ArgMatches) -> Result<i32> {
 
     // Use the default options for format readers other than for gapless playback.
     let format_opts =
-        FormatOptions { enable_gapless: !args.is_present("no-gapless"), ..Default::default() };
+        FormatOptions { enable_gapless: !args.no_gapless, ..Default::default() };
 
     // Use the default options for metadata readers.
     let metadata_opts: MetadataOptions = Default::default();
 
-    // Get the value of the track option, if provided.
-    let track = match args.value_of("track") {
-        Some(track_str) => track_str.parse::<usize>().ok(),
-        _ => None,
-    };
-
-    let no_progress = args.is_present("no-progress");
+    let no_progress = args.no_progress;
 
     // Probe the media source stream for metadata and get the format reader.
     match symphonia::default::get_probe().format(&hint, mss, &format_opts, &metadata_opts) {
         Ok(mut probed) => {
             // Dump visuals if requested.
-            if args.is_present("dump-visuals") {
+            if args.dump_visuals {
                 let name = match path.file_name() {
                     Some(name) if name != "-" => name,
                     _ => OsStr::new("NoName"),
@@ -183,38 +158,33 @@ fn run(args: &ArgMatches) -> Result<i32> {
             }
 
             // Select the operating mode.
-            if args.is_present("verify-only") {
+            if args.verify_only {
                 // Verify-only mode decodes and verifies the audio, but does not play it.
                 decode_only(probed.format, &DecoderOptions { verify: true, ..Default::default() })
-            }
-            else if args.is_present("decode-only") {
+            } else if args.decode_only {
                 // Decode-only mode decodes the audio, but does not play or verify it.
                 decode_only(probed.format, &DecoderOptions { verify: false, ..Default::default() })
-            }
-            else if args.is_present("probe-only") {
+            } else if args.probe_only {
                 // Probe-only mode only prints information about the format, tracks, metadata, etc.
                 print_format(path, &mut probed);
                 Ok(0)
-            }
-            else {
+            } else {
                 // Playback mode.
                 print_format(path, &mut probed);
 
                 // If present, parse the seek argument.
-                let seek = if let Some(time) = args.value_of("seek") {
-                    Some(SeekPosition::Time(time.parse::<f64>().unwrap_or(0.0)))
-                }
-                else {
-                    args.value_of("seek-ts")
-                        .map(|ts| SeekPosition::Timestamp(ts.parse::<u64>().unwrap_or(0)))
+                let seek = if let Some(time) = args.seek {
+                    Some(SeekPosition::Time(time))
+                } else {
+                    args.seek_ts.map(SeekPosition::Timestamp)
                 };
 
                 // Set the decoder options.
                 let decode_opts =
-                    DecoderOptions { verify: args.is_present("verify"), ..Default::default() };
+                    DecoderOptions { verify: args.verify, ..Default::default() };
 
                 // Play it!
-                play(probed.format, track, seek, &decode_opts, no_progress)
+                play(probed.format, args.track, seek, &decode_opts, no_progress)
             }
         }
         Err(err) => {
@@ -312,8 +282,7 @@ fn play(
                 0
             }
         }
-    }
-    else {
+    } else {
         // If not seeking, the seek timestamp is 0.
         0
     };
@@ -407,8 +376,7 @@ fn play_track(
 
                     // Try to open the audio output.
                     audio_output.replace(output::try_open(spec, duration).unwrap());
-                }
-                else {
+                } else {
                     // TODO: Check the audio spec. and duration hasn't changed.
                 }
 
@@ -504,15 +472,14 @@ fn dump_visuals(probed: &mut ProbeResult, file_name: &OsStr) {
             info!("visuals that are part of the container format are preferentially dumped.");
             info!("not dumping additional visuals that were found while probing.");
         }
-    }
-    else if let Some(metadata) = probed.metadata.get().as_ref().and_then(|m| m.current()) {
+    } else if let Some(metadata) = probed.metadata.get().as_ref().and_then(|m| m.current()) {
         for (i, visual) in metadata.visuals().iter().enumerate() {
             dump_visual(visual, file_name, i);
         }
     }
 }
 
-fn print_format(path: &Path, probed: &mut ProbeResult) {
+fn print_format(path: &PathBuf, probed: &mut ProbeResult) {
     println!("+ {}", path.display());
     print_tracks(probed.format.tracks());
 
@@ -527,8 +494,7 @@ fn print_format(path: &Path, probed: &mut ProbeResult) {
             info!("tags that are part of the container format are preferentially printed.");
             info!("not printing additional tags that were found while probing.");
         }
-    }
-    else if let Some(metadata_rev) = probed.metadata.get().as_ref().and_then(|m| m.current()) {
+    } else if let Some(metadata_rev) = probed.metadata.get().as_ref().and_then(|m| m.current()) {
         print_tags(metadata_rev.tags());
         print_visuals(metadata_rev.visuals());
     }
@@ -557,8 +523,7 @@ fn print_tracks(tracks: &[Track]) {
 
             if let Some(codec) = symphonia::default::get_codecs().get_codec(params.codec) {
                 println!("{} ({})", codec.long_name, codec.short_name);
-            }
-            else {
+            } else {
                 println!("Unknown (#{})", params.codec);
             }
 
@@ -572,8 +537,7 @@ fn print_tracks(tracks: &[Track]) {
                         fmt_time(params.start_ts, tb),
                         params.start_ts
                     );
-                }
-                else {
+                } else {
                     println!("|          Start Time:      {}", params.start_ts);
                 }
             }
@@ -584,8 +548,7 @@ fn print_tracks(tracks: &[Track]) {
                         fmt_time(n_frames, tb),
                         n_frames
                     );
-                }
-                else {
+                } else {
                     println!("|          Frames:          {}", n_frames);
                 }
             }
@@ -637,8 +600,7 @@ fn print_cues(cues: &[Cue]) {
                             "{}",
                             print_tag_item(tag_idx + 1, &format!("{:?}", std_key), &tag.value, 21)
                         );
-                    }
-                    else {
+                    } else {
                         println!("{}", print_tag_item(tag_idx + 1, &tag.key, &tag.value, 21));
                     }
                 }
@@ -700,8 +662,7 @@ fn print_visuals(visuals: &[Visual]) {
             if let Some(usage) = visual.usage {
                 println!("|     [{:0>2}] Usage:      {:?}", idx + 1, usage);
                 println!("|          Media Type: {}", visual.media_type);
-            }
-            else {
+            } else {
                 println!("|     [{:0>2}] Media Type: {}", idx + 1, visual.media_type);
             }
             if let Some(dimensions) = visual.dimensions {
@@ -729,8 +690,7 @@ fn print_visuals(visuals: &[Visual]) {
                         "{}",
                         print_tag_item(tag_idx + 1, &format!("{:?}", std_key), &tag.value, 21)
                     );
-                }
-                else {
+                } else {
                     println!("{}", print_tag_item(tag_idx + 1, &tag.key, &tag.value, 21));
                 }
             }
@@ -822,8 +782,7 @@ fn print_progress(ts: u64, dur: Option<u64>, tb: Option<TimeBase>) {
             write!(output, " {} -{}:{:0>2}:{:0>4.1}", progress_bar(ts, dur), hours, mins, secs)
                 .unwrap();
         }
-    }
-    else {
+    } else {
         write!(output, "\r\u{25b6}\u{fe0f}  {}", ts).unwrap();
     }
 
